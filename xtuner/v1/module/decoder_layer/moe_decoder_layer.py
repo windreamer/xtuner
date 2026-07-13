@@ -17,6 +17,7 @@ from xtuner.v1.module import (
     GatedDeltaNet,
     GatedDeltaNetConfig,
     GreedyRouterConfig,
+    HashRouterConfig,
     MHAConfig,
     MLAConfig,
     MultiHeadAttention,
@@ -25,6 +26,7 @@ from xtuner.v1.module import (
     RMSNorm,
     RouterResults,
 )
+from xtuner.v1.module.attention.dsa import DeepSeekSparseAttention, DSAConfig
 from xtuner.v1.module.dispatcher import (
     CombineResult,
     DispatchResult,
@@ -40,12 +42,10 @@ from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
 
-
 RouterLogits: TypeAlias = torch.Tensor
 RouterWeights: TypeAlias = torch.Tensor
 RouterTopKIds: TypeAlias = torch.Tensor
 HiddenStates: TypeAlias = torch.Tensor
-
 
 class MoEDecoderLayerOutput(TypedDict):
     """Per-micro-batch outputs of one :class:`MoEDecoderLayer` forward."""
@@ -54,7 +54,6 @@ class MoEDecoderLayerOutput(TypedDict):
     router_logits: RouterLogits
     router_weights: RouterWeights
     router_topk_ids: RouterTopKIds
-
 
 class MoEDecoderLayerMicroBatchOutput(TypedDict):
     """Outputs of one :class:`MoEDecoderLayer` forward over several micro-
@@ -68,10 +67,8 @@ class MoEDecoderLayerMicroBatchOutput(TypedDict):
     router_weights: list[RouterWeights]
     router_topk_ids: list[RouterTopKIds]
 
-
 class MoEActFnProtocol(Protocol):
     def __call__(self, fused_x: torch.Tensor, split_dim: int = -1) -> torch.Tensor: ...
-
 
 class MoEActFnConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -86,7 +83,6 @@ class MoEActFnConfig(BaseModel):
         if self.act_type == "clipped_swiglu":
             act_fn = partial(act_fn, alpha=self.clip_alpha, limit=self.clip_limit)
         return act_fn
-
 
 class MoEMLP(nn.Module):
     def __init__(
@@ -111,7 +107,6 @@ class MoEMLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
-
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -119,7 +114,7 @@ class MoEGate(nn.Module):
         hidden_size: int,
         n_routed_experts: int,
         num_experts_per_tok: int,
-        router_config: GreedyRouterConfig | NoAuxRouterConfig,
+        router_config: GreedyRouterConfig | NoAuxRouterConfig | HashRouterConfig,
         gate_bias: bool = False,
         router_compute_dtype: Literal["float32", "native"] = "float32",
     ):
@@ -140,7 +135,11 @@ class MoEGate(nn.Module):
             self.bias = nn.Parameter(torch.zeros(self.n_routed_experts))
 
     def forward(
-        self, hidden_states: torch.Tensor, rollout_routed_experts: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        rollout_routed_experts: torch.Tensor | None = None,
+        *,
+        input_ids: torch.Tensor | None = None,
     ) -> RouterResults:
         _, _, h = hidden_states.shape
         ### compute gating score
@@ -160,14 +159,13 @@ class MoEGate(nn.Module):
         else:
             bias = bias.float() if bias is not None else None
             logits = F.linear(hidden_states.float(), weight.float(), bias)
-        return self.router(logits, rollout_routed_experts)
+        return self.router(logits, rollout_routed_experts, input_ids=input_ids)
 
         # Debug for aligning with hf implementation.
         # logits = F.linear(hidden_states, weight, bias)
         # gate = self.router(logits, rollout_routed_experts)
         # gate['topk_weights'] = gate['topk_weights'].float()
         # return gate
-
 
 class MoEBlock(nn.Module):
     def __init__(
@@ -221,7 +219,6 @@ class MoEBlock(nn.Module):
         res = self.fused_w2(out, tokens_per_expert, decoding)
         return res
 
-
 class MoEDecoderLayer(nn.Module):
     """MoE decoder layer."""
 
@@ -242,11 +239,11 @@ class MoEDecoderLayer(nn.Module):
         n_shared_experts: int,
         with_shared_expert_gate: bool = False,
         hidden_factor: float = 1.0,
-        attention_config: MHAConfig | MLAConfig | GatedDeltaNetConfig,
+        attention_config: MHAConfig | MLAConfig | GatedDeltaNetConfig | DSAConfig,
         rope_scaling_cfg: RopeScalingConfig | None = None,
         layer_type: Literal["full_attention", "sliding_attention"] | None = None,
         generate_config: GenerateConfig | None = None,
-        router_config: GreedyRouterConfig | NoAuxRouterConfig,
+        router_config: GreedyRouterConfig | NoAuxRouterConfig | HashRouterConfig,
         router_compute_dtype: Literal["float32", "native"] = "float32",
         moe_act_fn_cfg: MoEActFnConfig,
         float8_cfg: Float8Config | None = None,
@@ -255,6 +252,7 @@ class MoEDecoderLayer(nn.Module):
         ep_mesh: DeviceMesh | None = None,
         expert_tp_mesh: DeviceMesh | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
+        attention_module: nn.Module | None = None,
     ):
         super().__init__()
         self.ep_mesh = ep_mesh
@@ -264,14 +262,32 @@ class MoEDecoderLayer(nn.Module):
         self.n_shared_experts = n_shared_experts
         self.hidden_factor = hidden_factor
 
-        self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet = attention_config.build(
-            hidden_size=hidden_size,
-            layer_idx=layer_idx,
-            generate_config=generate_config,
-            rope_scaling_cfg=rope_scaling_cfg,
-            layer_type=layer_type,
-            float8_cfg=float8_cfg,
-        )
+        # `attention_module` overrides the build path when set. Why: DSAConfig.build
+        # requires a `compress_ratio` argument that varies per-layer and is owned by
+        # the model class (DeepSeekV4) — threading it through every `attention_config.build`
+        # call would either widen the build signatures of MLA/MHA/GatedDeltaNet (none of
+        # which use it) or force a layer-type-aware branch here. Letting the caller
+        # pre-build the DSA module keeps the spaghetti in DeepSeekV4.build_layers,
+        # which already has all the per-layer context. The existing MLA/MHA/Gated paths
+        # still go through `attention_config.build` unchanged.
+        self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet | DeepSeekSparseAttention
+        if attention_module is not None:
+            self.self_attn = attention_module  # type: ignore[assignment]
+        else:
+            if isinstance(attention_config, DSAConfig):
+                raise ValueError(
+                    "DSAConfig requires a pre-built `attention_module` because DSAConfig.build needs "
+                    "a per-layer `compress_ratio`. Construct DeepSeekSparseAttention in your model's "
+                    "`build_layers` and pass it via the `attention_module` kwarg."
+                )
+            self.self_attn = attention_config.build(
+                hidden_size=hidden_size,
+                layer_idx=layer_idx,
+                generate_config=generate_config,
+                rope_scaling_cfg=rope_scaling_cfg,
+                layer_type=layer_type,
+                float8_cfg=float8_cfg,
+            )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
         self.layer_idx = layer_idx
 
@@ -335,6 +351,7 @@ class MoEDecoderLayer(nn.Module):
         *,
         seq_ctx: SequenceContext | list[SequenceContext],
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
+        input_ids: torch.Tensor | list[torch.Tensor] | None = None,
     ) -> MoEDecoderLayerOutput | MoEDecoderLayerMicroBatchOutput:
         """Forward pass of the MoE decoder layer.
 
@@ -349,6 +366,9 @@ class MoEDecoderLayer(nn.Module):
                 ``hidden_states``.
             position_embeddings (tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]]):
                 Rotary position embeddings ``(cos, sin)``, aligned with ``hidden_states``.
+            input_ids (torch.Tensor | list[torch.Tensor], optional): Per-token ids for
+                hash-routed MoE gates. Only consumed by :class:`HashRouter`; ignored by
+                score-based routers.
 
         Returns:
             MoEDecoderLayerOutput | MoEDecoderLayerMicroBatchOutput: Hidden states and router
@@ -362,23 +382,31 @@ class MoEDecoderLayer(nn.Module):
             assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2, (
                 "position_embeddings should be a tuple of two tensors (position_ids, position_embeds)"
             )
+            assert input_ids is None or isinstance(input_ids, torch.Tensor), (
+                "Single-batch forward expects `input_ids` as a torch.Tensor (or None)"
+            )
             return self._forward(
                 hidden_states=hidden_states,
                 seq_ctx=seq_ctx,
                 position_embeddings=position_embeddings,
+                input_ids=input_ids,
             )
-
         assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states), (
             "seq_ctx should be a list of SequenceContext instances with the same length as hidden_states"
         )
         assert isinstance(position_embeddings, list) and len(position_embeddings) == len(hidden_states), (
             "position_embeddings should be a list of tuples with the same length as hidden_states"
         )
+        if input_ids is not None:
+            assert isinstance(input_ids, list) and len(input_ids) == len(hidden_states), (
+                "Micro-batch forward expects `input_ids` as a list aligned with `hidden_states`"
+            )
 
         return self._micro_batch_forward(
             hidden_states_list=hidden_states,
             seq_ctx_list=seq_ctx,
             position_embeddings_list=position_embeddings,
+            input_ids_list=input_ids,
         )
 
     def _hf_expert_forward_for_debug(self, hidden_states: torch.Tensor, router_results: RouterResults, origin_shape):
@@ -425,6 +453,7 @@ class MoEDecoderLayer(nn.Module):
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_kwargs: dict[str, object] | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> MoEDecoderLayerOutput:
         residual, hidden_states, router_results, attn_outputs = self._pre_moe_forward(
             hidden_states=hidden_states,
@@ -432,6 +461,7 @@ class MoEDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             state=ForwardState.TRAINING,
             attention_kwargs=attention_kwargs,
+            input_ids=input_ids,
         )
 
         origin_shape = hidden_states.shape
@@ -544,6 +574,7 @@ class MoEDecoderLayer(nn.Module):
         seq_ctx_list: list[SequenceContext],
         position_embeddings_list: list[tuple[torch.Tensor, torch.Tensor]],
         attention_kwargs_list: list[dict[str, object]] | None = None,
+        input_ids_list: list[torch.Tensor] | None = None,
     ) -> MoEDecoderLayerMicroBatchOutput:
         origin_shape = hidden_states_list[0].shape
         assert all(hidden_states.shape == origin_shape for hidden_states in hidden_states_list), (
@@ -561,17 +592,26 @@ class MoEDecoderLayer(nn.Module):
         dispatched_list: list[DispatchResult] = []
         pre_moe_forward_out_list: list[torch.Tensor] = []
 
+        # Pad input_ids_list with None so the zip below stays aligned when callers
+        # (typically score-routed models) don't provide input_ids.
+        if input_ids_list is None:
+            input_ids_iter: list[torch.Tensor | None] = [None] * intra_layer_micro_batch
+        else:
+            input_ids_iter = list(input_ids_list)
+
         # Attention + gate + pre-dispatch
         for (
             hidden_states,
             attention_kwargs,
             seq_ctx,
             position_embeddings,
+            mb_input_ids,
         ) in zip(
             hidden_states_list,
             attention_kwargs_list,
             seq_ctx_list,
             position_embeddings_list,
+            input_ids_iter,
         ):
             residual, hidden_states, router_results, attn_outputs = self._pre_moe_forward(
                 hidden_states=hidden_states,
@@ -579,6 +619,7 @@ class MoEDecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 state=ForwardState.TRAINING,
                 attention_kwargs=attention_kwargs,
+                input_ids=mb_input_ids,
             )
             pre_moe_forward_out_list.append(hidden_states)
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -711,6 +752,7 @@ class MoEDecoderLayer(nn.Module):
         state: ForwardState,
         past_key_values: list[list[torch.Tensor]] | None = None,
         attention_kwargs: dict[str, object] | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RouterResults, AttnOutputs]:
         # NOTE: In order to allow `torch.compile` to compile the ops before and after attention as much as possible,
         # attention, post-layernorm and gate are implemented in one function
@@ -758,9 +800,7 @@ class MoEDecoderLayer(nn.Module):
             if seq_ctx.offload_rollout_routed_experts and rollout_routed_experts.device != hidden_states.device:
                 rollout_routed_experts = rollout_routed_experts.contiguous()
                 rollout_routed_experts = rollout_routed_experts.to(hidden_states.device)
-        else:
-            rollout_routed_experts = None
-        router_results: RouterResults = self.gate(hidden_states, rollout_routed_experts)
+        router_results: RouterResults = self.gate(hidden_states, rollout_routed_experts, input_ids=input_ids)
         return residual, hidden_states, router_results, attn_outputs
 
     def _shared_experts_forward(
@@ -798,7 +838,6 @@ class MoEDecoderLayer(nn.Module):
             block_size=block_size,
         )
 
-
 class _BackwardSync(Function):
     @staticmethod
     def forward(
@@ -823,6 +862,5 @@ class _BackwardSync(Function):
             current_stream.record_event(ctx.finished_backward_event)
 
         return grad_output, None, None, None
-
 
 backward_sync = _BackwardSync.apply
