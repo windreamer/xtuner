@@ -35,6 +35,7 @@ XTuner v1 的 `TrainEngine` 通过不同的 `TransformerConfig` 子类支持多�
 | `Qwen3VLTextMoE30BA3Config` | `Qwen3MoEConfig` | MoE（VL 文本主干） | 约 30B 总参，用于多模态 |
 | `Qwen3VLTextMoE235BA22Config` | `Qwen3MoEConfig` | MoE（VL 文本主干） | 约 235B 总参，用于多模态 |
 | `Qwen3_5_VLTextMoE35BA3BConfig` | `Qwen3_5_VLTextMoEConfig` | MoE（VL 文本主干） | 约 35B 总参 / 约 3B 激活，用于多模态 |
+| `Glm53FlashTowerConfig` | `Glm53FlashConfig` | MoE | 约 320B 总参 / 18B 激活, KDA + KPool-DSA + mHC 混合 |
 
 ## Compose 多模态模型
 

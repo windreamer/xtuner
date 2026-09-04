@@ -35,6 +35,7 @@ The following table lists the **concrete model configs** that inherit from the b
 | `Qwen3VLTextMoE30BA3Config` | `Qwen3MoEConfig` | MoE (VL backbone) | ~30B total, for multimodal |
 | `Qwen3VLTextMoE235BA22Config` | `Qwen3MoEConfig` | MoE (VL backbone) | ~235B total, for multimodal |
 | `Qwen3_5_VLTextMoE35BA3BConfig` | `Qwen3_5_VLTextMoEConfig` | MoE (VL backbone) | ~35B total / ~3B activated, for multimodal |
+| `Glm53FlashTowerConfig` | `Glm53FlashConfig` | MoE | ~320B total / ~18B activated, hybrid KDA + KPool-DSA + mHC |
 
 ## Compose Models
 

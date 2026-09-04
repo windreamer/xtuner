@@ -48,6 +48,15 @@ def default_init_weights(module: nn.Module) -> set[str]:
         if id(module) in seen:
             return
 
+        # Modules with exotic parameter names (e.g. KDA ``A_log`` / ``dt_bias``,
+        # mHC ``fn`` / ``base`` / ``scale``) declare their own initializer and
+        # report the param names they covered, so the completeness check below
+        # still sees them.
+        custom = getattr(module, "custom_init_weights", None)
+        if callable(custom):
+            prefix = f"{name}." if name else ""
+            initialized_params.update(f"{prefix}{p}" for p in custom())
+
         _default_init_atom(name, module)
         for child_name, child in module.named_children():
             child_name = f"{child_name}" if name == "" else f"{name}.{child_name}"
