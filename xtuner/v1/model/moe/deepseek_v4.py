@@ -470,6 +470,11 @@ class DeepSeekV4Config(MoEConfig):
         moe_act_fn_cfg = MoEActFnConfig(
             act_type="clamped_swiglu",
             clip_limit=float(getattr(cfg, "swiglu_limit", 10.0)),
+            # HF's `DeepseekV4MoE` builds `shared_experts` as a `DeepseekV4MLP`, whose
+            # forward hard-codes the same `swiglu_limit` clamp as the routed experts —
+            # so the shared expert must be clamped here too or its pre-activations
+            # diverge from the reference on real checkpoints.
+            clamp_shared_expert=True,
         )
 
         return cls(

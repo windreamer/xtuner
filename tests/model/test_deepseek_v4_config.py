@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4RotaryEmbedding
 from xtuner.v1.model.moe.deepseek_v4 import DeepSeekV4Config
-from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig
+from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig, MoEMLP
 from xtuner.v1.module.rope.rope import DualRotaryEmbedding
 
 
@@ -227,6 +227,37 @@ class TestDeepSeekV4ActFn:
         expected = (up_c + 1) * gate_c * torch.sigmoid(gate_c * 1.702)
 
         torch.testing.assert_close(act_fn(torch.cat([gate, up], dim=-1)), expected)
+
+    def test_from_hf_enables_shared_expert_clamp(self, xtuner_cfg) -> None:
+        """``from_hf`` must turn the shared-expert clamp on to match HF.
+
+        HF's ``DeepseekV4MoE`` builds ``shared_experts`` as a ``DeepseekV4MLP``, whose forward
+        hard-codes the same ``swiglu_limit`` clamp as the routed experts. XTuner gates that
+        clamp behind ``clamp_shared_expert`` (default off, so pre-V4 runs keep their numerics);
+        if ``from_hf`` leaves it off, the shared expert silently diverges from HF on real
+        checkpoints — invisible on random-weight parity unless a pre-activation exceeds the
+        limit. ``clip_limit`` must be threaded through as well so the clamp bound follows the
+        checkpoint's ``swiglu_limit`` (3.0 here, deliberately not the 10.0 default).
+        """
+        act_cfg = xtuner_cfg.moe_act_fn_cfg
+        assert act_cfg.clamp_shared_expert is True
+        assert act_cfg.clip_limit == _SWIGLU_LIMIT
+
+        shared = MoEMLP(
+            hidden_size=32,
+            n_shared_experts=1,
+            moe_intermediate_size=16,
+            hidden_act="silu",
+            swiglu_limit=act_cfg.clip_limit if act_cfg.clamp_shared_expert else None,
+        )
+        assert shared.swiglu_limit == _SWIGLU_LIMIT
+
+        torch.manual_seed(0)
+        x = torch.randn(8, 32) * 8  # push pre-activations past the limit
+        gate = shared.gate_proj(x)
+        up = shared.up_proj(x)
+        expected = shared.down_proj(F.silu(gate.clamp(max=_SWIGLU_LIMIT)) * up.clamp(min=-_SWIGLU_LIMIT, max=_SWIGLU_LIMIT))
+        torch.testing.assert_close(shared(x), expected)
 
 
 class TestDeepSeekV4LegacyConfigSchema:
