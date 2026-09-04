@@ -22,8 +22,8 @@ from .dense.dense import Dense
 from .dense.qwen2 import Qwen2Dense7BConfig, Qwen2DenseConfig
 from .dense.qwen3 import Qwen3Dense0P6BConfig, Qwen3Dense4BConfig, Qwen3Dense8BConfig, Qwen3DenseConfig
 from .moe.deepseek_v3 import DeepSeekV3Config
-from .moe.glm52 import Glm52MoEConfig
 from .moe.deepseek_v4 import DeepSeekV4Config
+from .moe.glm52 import Glm52MoEConfig
 from .moe.gpt_oss import GptOss21BA3P6Config, GptOss117BA5P8Config, GptOssConfig
 from .moe.moe import BalancingLossConfig, MoE, MoEConfig, MoEModelOutputs, ZLossConfig
 from .moe.qwen3 import Qwen3MoE30BA3Config, Qwen3MoEConfig, Qwen3MoEFoPEConfig

@@ -64,16 +64,11 @@ from xtuner.v1.module import (
 )
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import (
     DenseDecoderLayer,
-    DenseDecoderLayerMicroBatchOutput,
-    DenseDecoderLayerOutput,
 )
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEActFnConfig,
     MoEBlock,
     MoEDecoderLayer,
-    MoEDecoderLayerMicroBatchOutput,
-    MoEDecoderLayerOutput,
-    MoEGate,
 )
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
@@ -1233,6 +1228,7 @@ class MoE(BaseModel):
 
         mtp_losses = mtp_losses / len(mtp_loss_ctx_list)
         return {"mtp_loss": mtp_losses * self.config.mtp_config.loss_scaling_factor}  # type: ignore
+
     def build_embeddings(self, config: MoEConfig):
         return nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
 
