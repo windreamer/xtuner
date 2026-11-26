@@ -26,6 +26,10 @@ export EVAL_INTERVAL="${EVAL_INTERVAL:-30}"
 export QAD_SIM_SEED="${QAD_SIM_SEED:-42}"
 export MASTER_PORT="${MASTER_PORT:-61117}"
 export PYTHONUNBUFFERED=1
+# torch 2.13 CUDA caching allocator fragments badly on the W4A8 per-group path (OOM at
+# ~22GB reserved with ~0.7GB reserved-but-unallocated); expandable segments fixes it
+# without touching numerics.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # flash-attn is not installed in this environment and torch 2.13's compiled flex_attention
 # fails on 2048-token packed rows (data-dependent guard, see logs). Force the bitwise
 # HF-parity eager attention for teacher, student and replay alike (consistency is what the
@@ -71,7 +75,7 @@ EOF
 
 echo "[sim] stage 4/6: experiments (LoRA probe + W8A8+KV8 + W4A8+KV8 + W4A8+KV-bf16)" | tee -a "${LOG_DIR}/pipeline.log"
 PYTHONPATH="${REPO_ROOT}/work_dir/qad_sim${PYTHONPATH:+:${PYTHONPATH}}" \
-torchrun --nproc-per-node=1 --nnodes=1 --master-addr=127.0.0.1 --master-port="${MASTER_PORT}" \
+"${REPO_ROOT}/.venv/bin/torchrun" --nproc-per-node=1 --nnodes=1 --master-addr=127.0.0.1 --master-port="${MASTER_PORT}" \
   work_dir/qad_sim/run_all.py \
   --model-dir "${MODEL_DIR}" \
   --train-jsonl "${SIM_DIR}/data/train.jsonl" \
