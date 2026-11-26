@@ -1,5 +1,3 @@
-from typing import Literal
-
 import pytest
 from pydantic import ValidationError
 
@@ -36,12 +34,22 @@ class TestForSchema:
     def test_w4a8_policy(self) -> None:
         cfg = QADQuantConfig.for_schema("w4a8")
         assert cfg.quant_schema == "w4a8"
+        assert cfg.selective.exclude == ["lm_head"]
         assert cfg.selective.exclude_first_k_blocks == 1
         assert cfg.selective.exclude_last_k_blocks == 1
 
     def test_w8a8_policy(self) -> None:
         cfg = QADQuantConfig.for_schema("w8a8")
         assert cfg.quant_schema == "w8a8"
+        assert "lm_head" in cfg.selective.exclude
+        assert cfg.selective.exclude_first_k_blocks == 0
+        assert cfg.selective.exclude_last_k_blocks == 0
+
+    def test_user_selective_respected_as_is(self) -> None:
+        cfg = QADQuantConfig.for_schema("w4a8", selective=SelectiveQuantConfig(exclude=["x"]))
+        assert cfg.quant_schema == "w4a8"
+        assert cfg.selective.exclude == ["x"]
+        assert "lm_head" not in cfg.selective.exclude
         assert cfg.selective.exclude_first_k_blocks == 0
         assert cfg.selective.exclude_last_k_blocks == 0
 

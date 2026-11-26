@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -59,19 +59,24 @@ class QADQuantConfig(BaseModel):
     scale_freeze_last_ratio: float = Field(default=0.1, ge=0, le=1)
 
     @classmethod
-    def for_schema(cls, schema: Literal["w8a8", "w4a8"]) -> "QADQuantConfig":
-        """Build a config with the default block-exclusion policy of the given
+    def for_schema(cls, schema: Literal["w8a8", "w4a8"], **kwargs: Any) -> "QADQuantConfig":
+        """Build a config with the default layer-exclusion policy of the given
         schema.
 
         Args:
             schema (Literal["w8a8", "w4a8"]): Target quantization schema.
+            **kwargs (Any): Field overrides forwarded to the constructor. When ``selective`` is not
+                provided, the schema default policy is applied (see Returns); when provided, it is
+                respected as-is and no defaults are merged into it.
 
         Returns:
-            QADQuantConfig: Defaults per design §4.1: ``w4a8`` excludes the first and last block,
-            ``w8a8`` excludes none.
+            QADQuantConfig: Defaults per design §4.1: ``lm_head`` is always excluded (quantizing it
+            directly shifts the output distribution); ``w4a8`` additionally excludes the first and
+            last decoder block, ``w8a8`` excludes none.
         """
         first_k, last_k = (1, 1) if schema == "w4a8" else (0, 0)
-        return cls(
-            quant_schema=schema,
-            selective=SelectiveQuantConfig(exclude_first_k_blocks=first_k, exclude_last_k_blocks=last_k),
-        )
+        if "selective" not in kwargs:
+            kwargs["selective"] = SelectiveQuantConfig(
+                exclude=["lm_head"], exclude_first_k_blocks=first_k, exclude_last_k_blocks=last_k
+            )
+        return cls(quant_schema=schema, **kwargs)
