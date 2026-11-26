@@ -18,8 +18,11 @@ Scale source (§6.3): per-step amax with EMA smoothing ``ema = decay*ema + (1-de
 
 Attach mechanism (§6.2). :func:`apply_kv_quantization` selects attention modules by a documented
 pattern (class name contains ``"Attention"`` or ``"MLA"``, or the module-name path contains
-``"self_attn"``/``"attention"``; bare ``nn.Linear`` are never selected) and wires quantization at
-the module's K/V entry points:
+``"self_attn"``/``"attention"``; bare ``nn.Linear`` are never selected, and neither are
+quantizer-owned submodules — ``Quantizer`` instances such as the ``IntQuantizer``
+``_weight_quantizer``/``_act_quantizer`` children that ``apply_quantization`` registers on
+``FakeQuantLinear``, or any module under a path segment ending in ``_quantizer``) and wires
+quantization at the module's K/V entry points:
 
 1. Forward-argument interception — if the module's ``forward`` signature has parameters named
    ``k``/``v``/``key``/``value``/``keys``/``values``, the bound method is patched so those tensor
@@ -44,7 +47,7 @@ import torch
 from torch import nn
 
 from .config import KVQConfig
-from .quantizer import _QuantDequantSTE
+from .quantizer import Quantizer, _QuantDequantSTE
 
 
 _EPS_FP32: float = torch.finfo(torch.float32).eps
@@ -430,9 +433,26 @@ def _patch_projections(module: nn.Module, quantizer: KVCacheQuantizer, handle: K
         )
 
 
+def _is_quant_internal(name: str, module: nn.Module) -> bool:
+    """Detect quantizer-owned submodules that must never be selected as
+    attention roots.
+
+    ``apply_quantization`` (``fake_quant_linear``) registers ``IntQuantizer`` submodules
+    (``_weight_quantizer``/``_act_quantizer``) on ``FakeQuantLinear``, and an attached :class:`KVCacheQuantizer` itself
+    becomes a ``_qad_kv_quantizer`` submodule of its attention module. Their ``named_modules()`` paths (e.g.
+    ``"...self_attn.k_proj._act_quantizer"``) otherwise match the attention-name pattern and would be patched instead
+    of the real attention.
+    """
+    if isinstance(module, Quantizer) or "Quantizer" in type(module).__name__:
+        return True
+    return any(segment.endswith("_quantizer") for segment in name.split("."))
+
+
 def _is_kv_quantizable(name: str, module: nn.Module) -> bool:
     """Selection pattern (documented on the module docstring): class or name
-    path marks attention."""
+    path marks attention; quantizer-owned submodules never qualify."""
+    if _is_quant_internal(name, module):
+        return False
     if isinstance(module, nn.Linear):
         return False
     cls_name = type(module).__name__

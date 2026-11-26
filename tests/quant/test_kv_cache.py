@@ -5,7 +5,8 @@ import pytest
 import torch
 from torch import nn
 
-from xtuner.v1.quant.config import KVQConfig
+from xtuner.v1.quant.config import KVQConfig, QADQuantConfig
+from xtuner.v1.quant.fake_quant_linear import apply_quantization
 from xtuner.v1.quant.kv_cache import (
     KVCacheQuantizer,
     apply_kv_quantization,
@@ -43,6 +44,68 @@ def expected_stub_output(
     replicating the EMA state."""
     ref = KVCacheQuantizer(ema_decay=decay)
     return (ref.quantize_key(k) * ref.quantize_value(v)).sum(dim=-1, keepdim=True) * stub.gate.detach() * alpha
+
+
+class _DummySelfAttention(nn.Module):
+    """Plain QKV attention computing K/V internally from ``k_proj``/``v_proj``
+    children.
+
+    ``capture`` optionally records the K/V tensors right after their projections, so tests can
+    bit-compare the pre- and post-attach values entering the attention computation.
+
+    Args:
+        hidden_size (int): Input hidden size.
+        kv_heads (int): Number of K/V heads; query head count is fixed at 2.
+        head_dim (int): Per-head width of the projection outputs.
+        seq_len (int): Sequence length; the block operates on token-major ``(B*S, H)`` activations,
+            the 2-D shape ``IntQuantizer`` per-token activation quantization is defined on.
+    """
+
+    def __init__(self, hidden_size: int = 8, kv_heads: int = 2, head_dim: int = 4, seq_len: int = 5) -> None:
+        super().__init__()
+        self.seq_len = seq_len
+        self.num_key_value_heads = kv_heads
+        self.head_dim = head_dim
+        self.q_proj = nn.Linear(hidden_size, 2 * head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, kv_heads * head_dim, bias=False)
+        self.capture: dict[str, torch.Tensor] | None = None
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        t = hidden.shape[0]
+        b = t // self.seq_len
+        s = self.seq_len
+        q = self.q_proj(hidden).view(b, s, 2, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden).view(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden).view(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        if self.capture is not None:
+            self.capture["k"] = k.detach().clone()
+            self.capture["v"] = v.detach().clone()
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.head_dim**0.5
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.matmul(probs, v)  # (B, 2, S, head_dim)
+        return out.transpose(1, 2).reshape(b * s, 2 * self.head_dim)
+
+
+class _DummyBlock(nn.Module):
+    """Decoder block whose attention child is named ``self_attn``, reproducing
+    the T7 module tree.
+
+    After ``apply_quantization``, ``named_modules()`` surfaces quantizer-owned paths like
+    ``"self_attn.k_proj._act_quantizer"`` that contain the ``self_attn`` segment.
+    """
+
+    def __init__(self, hidden_size: int = 8) -> None:
+        super().__init__()
+        self.self_attn = _DummySelfAttention(hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, 4 * hidden_size, bias=False),
+            nn.GELU(),
+            nn.Linear(4 * hidden_size, hidden_size, bias=False),
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden + self.mlp(self.self_attn(hidden))
 
 
 class TestAxisContract:
@@ -318,6 +381,60 @@ class TestAttachDetach:
         model = nn.Sequential(WeirdAttention())
         with pytest.raises(ValueError, match="Weird"):
             apply_kv_quantization(model, KVQConfig())
+
+
+class TestAttachAfterWeightActQuant:
+    """KV attach must keep selecting only real attention roots once
+    ``apply_quantization`` has registered quantizer-owned submodules under the
+    ``self_attn`` name path (T7 misfire)."""
+
+    def test_kv_attach_skips_quantizer_submodules_and_hits_real_attention(self) -> None:
+        torch.manual_seed(31)
+        model = _DummyBlock()
+        x = torch.randn(10, model.self_attn.q_proj.in_features)  # token-major (B*S, H)
+
+        # Trap setup: weight/act quantization first, so IntQuantizer submodules appear under
+        # "...self_attn.k_proj._act_quantizer" / "..._weight_quantizer" paths.
+        apply_quantization(model, QADQuantConfig.for_schema("w8a8"))
+        quantizer_paths = [name for name, _ in model.named_modules() if "_quantizer" in name]
+        assert any("self_attn" in name for name in quantizer_paths)  # the misfire candidates exist
+
+        capture_pre: dict[str, torch.Tensor] = {}
+        model.self_attn.capture = capture_pre
+        out_pre = model(x)
+        assert {"k", "v"} <= capture_pre.keys()
+
+        handles = apply_kv_quantization(model, KVQConfig(), kv_amax_ema_decay=0.5)
+        # Exactly one handle, bound to the real attention ROOT module, never a quantizer-owned path.
+        assert len(handles) == 1
+        assert handles[0].module is model.self_attn
+        name_by_id = {id(m): n for n, m in model.named_modules()}
+        handle_paths = [name_by_id[id(h.module)] for h in handles]
+        assert all("_quantizer" not in p for p in handle_paths)
+
+        # K/V interception lands on the real attention forward: the captured K/V are quantized
+        # bit-exactly per the KV sim, while the pre-attach run left them untouched.
+        capture_post: dict[str, torch.Tensor] = {}
+        model.self_attn.capture = capture_post
+        out_post = model(x)
+        assert not torch.equal(capture_post["k"], capture_pre["k"])
+        assert not torch.equal(capture_post["v"], capture_pre["v"])
+        ref = KVCacheQuantizer(ema_decay=0.5)
+        assert torch.equal(capture_post["k"], ref.quantize_key(capture_pre["k"]))
+        assert torch.equal(capture_post["v"], ref.quantize_value(capture_pre["v"]))
+        assert not torch.equal(out_post, out_pre)
+        assert handles[0].quantizer.k_scale is not None and handles[0].quantizer.v_scale is not None
+
+        # Idempotent re-attach: the stored "_qad_kv_quantizer" submodule must not be re-selected.
+        assert apply_kv_quantization(model, KVQConfig(), kv_amax_ema_decay=0.5) == handles
+        model.self_attn.capture = {}
+        assert torch.equal(model(x), out_post)
+
+        # Detach restores the (still weight/act-quantized) model bit-exactly.
+        assert remove_kv_quantization(model) == handles
+        model.self_attn.capture = {}
+        assert torch.equal(model(x), out_pre)
+        assert remove_kv_quantization(model) == []
 
 
 class TestRealAttention:
