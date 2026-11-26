@@ -10,4 +10,5 @@
    token_statistics.md
    loss.md
    float8.md
+   qad.md
    profile.md
