@@ -192,6 +192,10 @@ class IntQuantizer(Quantizer):
             return _QuantDequantSTE.apply(x_r, scale_r, self.qmin, self.qmax).reshape(x.shape)
         if self.scope == "per_channel" and scale.dim() == 1 and x.dim() > 1:
             scale_r = scale_r.reshape([x.shape[0]] + [1] * (x.dim() - 1))
+        if self.scope in ("per_token", "per_batch"):
+            # Deploy IR semantics (§4.3.2): quantize the flattened (-1, H) view, reshape back.
+            x_r = x.reshape(-1, x.shape[-1])
+            return _QuantDequantSTE.apply(x_r, scale_r, self.qmin, self.qmax).reshape(x.shape)
         return _QuantDequantSTE.apply(x, scale_r, self.qmin, self.qmax)
 
 

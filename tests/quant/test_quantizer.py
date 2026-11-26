@@ -130,6 +130,44 @@ class TestScopes:
         out = q.quant_dequant(x, scale)
         assert out.shape == x.shape
 
+    def test_per_token_3d_shape_preserved(self) -> None:
+        # IR semantics (§4.3.2): quantize the (-1, H) view, reshape back; (B, S, H) must work.
+        q = IntQuantizer(8, "per_token")
+        torch.manual_seed(1)
+        x = torch.randn(2, 5, 8)
+        scale = q.compute_scale(x)
+        assert scale.shape == (10, 1)
+        out = q.quant_dequant(x, scale)
+        assert out.shape == x.shape
+        ref = fake_quant_reference(x.reshape(-1, 8), scale, -128, 127).reshape(x.shape)
+        assert torch.equal(out, ref)
+
+    def test_per_token_3d_backward(self) -> None:
+        q = IntQuantizer(8, "per_token")
+        x = torch.randn(2, 5, 8, requires_grad=True)
+        out = q.quant_dequant(x, q.compute_scale(x))
+        grad = torch.autograd.grad(out.sum(), x)[0]
+        assert grad.shape == x.shape
+        assert torch.allclose(grad, torch.ones_like(grad))
+
+    def test_per_batch_3d_reduces_over_batch_times_seq(self) -> None:
+        # per_batch must aggregate over B*S rows, not per (B, S) position: position (0, 1)
+        # has the largest value 8, which only shows up when reducing over B*S.
+        q = IntQuantizer(8, "per_batch")
+        x = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                [[0.0, 2.0, 0.0], [0.0, 8.0, 0.0]],
+            ]
+        )
+        scale = q.compute_scale(x)
+        assert scale.shape == (3,)
+        assert torch.allclose(scale, torch.tensor([1.0 / 127.0, 8.0 / 127.0, EPS_FP32]))
+        out = q.quant_dequant(x, scale)
+        assert out.shape == x.shape
+        ref = fake_quant_reference(x.reshape(-1, 3), scale, -128, 127).reshape(x.shape)
+        assert torch.equal(out, ref)
+
     def test_per_channel_weight_scale_shape(self) -> None:
         q = IntQuantizer(8, "per_channel")
         w = torch.randn(6, 11)
@@ -268,18 +306,35 @@ class TestConstruction:
 
 
 class TestMsmodelslimGolden:
+    """Golden对拍 against msmodelslim deploy IR numerics (design §4.3, §10.1).
+
+    Skips cleanly when msmodelslim is not on PYTHONPATH.
+    """
+
     def test_golden_fake_quant(self) -> None:
-        impl = pytest.importorskip("msmodelslim.core.quantization_schema.api.impl.int_quantization")
-        calculate_qparam = getattr(impl, "calculate_qparam", None)
-        fake_quantize = getattr(impl, "fake_quantize", None)
-        if calculate_qparam is None or fake_quantize is None:
-            pytest.skip("msmodelslim int_quantization API functions unavailable")
+        api = pytest.importorskip("msmodelslim.core.quantization_schema.api")
+        qal = pytest.importorskip("msmodelslim.core.quantization_schema.qal")
+        calculate_qparam = api.calculate_qparam
+        fake_quantize = api.fake_quantize
+        q_dtype, q_scope, q_storage = qal.QDType, qal.QScope, qal.QStorage
+
         torch.manual_seed(0)
         q = IntQuantizer(8, "per_channel")
         w = torch.randn(4, 8)
-        golden_scale, golden_q = calculate_qparam(w, bits=8)  # type: ignore[misc]
         scale = q.compute_scale(w)
-        assert torch.allclose(scale, golden_scale.reshape(scale.shape), atol=1e-6)
         out = q.quant_dequant(w, scale)
-        golden_out = fake_quantize(w, golden_scale, bits=8)  # type: ignore[misc]
-        assert torch.allclose(out, golden_out.reshape(out.shape), atol=1e-6)
+        # mirror the deploy IR call site (w8a8_dynamic.py): caller computes min/max,
+        # calculate_qparam derives the symmetric scale, fake_quantize rounds+clamps+dequants.
+        q_param = calculate_qparam(
+            w.min(dim=1).values,
+            w.max(dim=1).values,
+            q_dtype.INT8,
+            q_scope.PER_CHANNEL,
+            True,
+        )
+        golden_scale = q_param.ext["scale"]
+        assert torch.allclose(scale, golden_scale, atol=1e-6)
+        # The IR stores weights transposed (in, out) so the per-output-channel scale
+        # broadcasts along the last dim; mirror that call shape verbatim.
+        golden_out = fake_quantize(q_storage(q_dtype.FLOAT, w.t()), q_param).value.t()
+        assert torch.allclose(out, golden_out, atol=1e-6)

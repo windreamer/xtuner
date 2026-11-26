@@ -6,7 +6,12 @@ import torch
 from torch import nn
 
 from xtuner.v1.quant.config import QADQuantConfig
-from xtuner.v1.quant.fake_quant_linear import FakeQuantLinear, apply_quantization, build_quantizers, remove_quantization
+from xtuner.v1.quant.fake_quant_linear import (
+    FakeQuantLinear,
+    apply_quantization,
+    build_quantizers,
+    remove_quantization,
+)
 from xtuner.v1.quant.quantizer import IntQuantizer
 
 
@@ -122,6 +127,27 @@ class TestFakeQuantLinear:
         output_add = output_add + x @ adapter.delta_w().detach().t()
         assert not torch.equal(out, output_add)
 
+    def test_forward_3d_activation_shape_preserved(self) -> None:
+        # Deploy-IR semantics: activations are flatten-quantized over (-1, H) rows and reshaped;
+        # FakeQuantLinear must pass 3-D (B, S, H) inputs through with shape preserved.
+        torch.manual_seed(6)
+        lin = FakeQuantLinear(16, 16, quant_cfg=QADQuantConfig(quant_schema="w8a8"))
+        x = torch.randn(2, 7, 16)
+        out = lin(x)
+        assert out.shape == (2, 7, 16)
+        assert torch.isfinite(out).all()
+        wq = IntQuantizer(8, "per_channel")
+        xq = IntQuantizer(8, "per_token")
+        x_q = fake_quant(x.reshape(-1, 16), xq).reshape(2, 7, 16)
+        expected = torch.nn.functional.linear(x_q, fake_quant(lin.weight.detach(), wq), lin.bias)
+        assert torch.equal(out, expected)
+
+    def test_backward_3d_input_gradient_flows(self) -> None:
+        lin = FakeQuantLinear(16, 8, quant_cfg=QADQuantConfig(quant_schema="w8a8"))
+        x = torch.randn(2, 7, 16)
+        lin(x).sum().backward()
+        assert lin.weight.grad is not None and torch.any(lin.weight.grad != 0)
+
     def test_ste_gradient_flows_to_weight(self) -> None:
         lin = FakeQuantLinear(8, 4, quant_cfg=QADQuantConfig(quant_schema="w8a8"))
         x = torch.randn(3, 8, requires_grad=True)
@@ -146,7 +172,6 @@ class TestFakeQuantLinear:
     def test_apply_remove_roundtrip(self) -> None:
         torch.manual_seed(5)
         lin = nn.Linear(8, 4)
-        ref = lin(torch.randn(3, 8))
         apply_quantization(lin, QADQuantConfig(quant_schema="w8a8"))
         assert isinstance(lin, FakeQuantLinear)
         remove_quantization(lin)
