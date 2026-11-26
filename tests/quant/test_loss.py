@@ -316,3 +316,88 @@ class TestQADLossReduction:
         QADLossContext.build_batches([ctx_full])
         loss_full = _forward_loss(ctx_full, torch.cat([student_logits_1, student_logits_2], dim=1))
         assert torch.allclose(loss_full, loss_1 + loss_2, atol=1e-6)
+
+
+def _coupling_logits(seed: int) -> torch.Tensor:
+    """Moderate-magnitude logits: log-softmax stays above ``log_prob_min_clamp`` and the
+    per-token KL stays below ``loss_max_clamp``, so neither clamp binds and the analytic
+    gradient comparison exercises the raw coupling."""
+    generator = torch.Generator().manual_seed(seed)
+    return 0.5 * torch.randn(BATCH, SEQ_LEN, VOCAB, generator=generator, dtype=torch.float64)
+
+
+def _coupling_mask(seed: int) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(seed)
+    loss_mask = (torch.rand(BATCH, SEQ_LEN, generator=generator) > 0.3).double()
+    loss_mask[0, 0] = 1.0  # keep at least one valid position
+    return loss_mask
+
+
+class TestQADGradientCoupling:
+    """Regression guard for Gate B: the loss context's autograd gradient w.r.t. the student
+    logits must equal the analytic forward-KL gradient. A sign flip, reverse-KL, mask/shift
+    misalignment or detached branch makes these tests fail."""
+
+    def test_full_kl_gradient_matches_analytic(self) -> None:
+        student_logits = _coupling_logits(seed=71).requires_grad_(True)
+        teacher_logits = _coupling_logits(seed=72)
+        loss_mask = _coupling_mask(seed=73)
+        loss_ctx = _make_context("qad_full_kl", loss_mask, torch.log_softmax(teacher_logits, dim=-1))
+
+        loss = _forward_loss(loss_ctx, student_logits)
+        (grad,) = torch.autograd.grad(loss, student_logits)
+
+        # d/ds_v of mask/N * sum_v' q_v' (log q_v' - log p_v') is mask/N * (p_v - q_v).
+        probs_student = torch.softmax(student_logits, dim=-1)
+        probs_teacher = torch.softmax(teacher_logits, dim=-1)
+        expected = (loss_mask / loss_mask.sum()).unsqueeze(-1) * (probs_student - probs_teacher)
+        assert torch.allclose(grad, expected, atol=1e-6)
+        # Masked positions must receive exactly zero gradient.
+        assert bool((grad[loss_mask == 0] == 0).all())
+
+    def test_topk_gradient_matches_analytic_tail_bin_form(self) -> None:
+        student_logits = _coupling_logits(seed=81).requires_grad_(True)
+        teacher_logits = _coupling_logits(seed=82)
+        loss_mask = _coupling_mask(seed=83)
+        target_token_ids, teacher_topk_logprobs = _teacher_topk_targets(teacher_logits, TOP_K)
+        loss_ctx = _make_context("qad_topk_forward", loss_mask, teacher_topk_logprobs, target_token_ids)
+
+        loss = _forward_loss(loss_ctx, student_logits)
+        (grad,) = torch.autograd.grad(loss, student_logits)
+
+        # Truncated KL = sum_{k in S} q_k (log q_k - log p_k) + q_tail (log q_tail - log p_tail)
+        # with p/q the softmax masses, p_tail = 1 - p_S, q_tail = 1 - q_S. Its exact gradient:
+        #   d/ds_v = p_v * (q_S - q_tail * (p_S - I[v in S]) / p_tail) - q_v * I[v in S].
+        probs_student = torch.softmax(student_logits, dim=-1)
+        probs_teacher = torch.softmax(teacher_logits, dim=-1)
+        q_selected = probs_teacher.gather(-1, index=target_token_ids)
+        q_selected_mass = q_selected.sum(dim=-1, keepdim=True)
+        q_tail = 1.0 - q_selected_mass
+        p_selected_mass = probs_student.gather(-1, index=target_token_ids).sum(dim=-1, keepdim=True)
+        p_tail = 1.0 - p_selected_mass
+        in_support = torch.zeros_like(probs_student)
+        in_support.scatter_(-1, target_token_ids, 1.0)
+        expected_per_token = probs_student * (q_selected_mass - q_tail * (p_selected_mass - in_support) / p_tail)
+        expected_per_token = expected_per_token - probs_teacher * in_support
+        expected = (loss_mask / loss_mask.sum()).unsqueeze(-1) * expected_per_token
+        assert torch.allclose(grad, expected, atol=1e-6)
+
+    def test_topk_full_support_gradient_equals_full_kl(self) -> None:
+        student_logits = _coupling_logits(seed=91)
+        teacher_logits = _coupling_logits(seed=92)
+        loss_mask = _coupling_mask(seed=93)
+        # K = V: the teacher support is a permutation of the whole vocabulary, so both tail
+        # bins vanish and the truncated kernel must reduce to the exact full-KL coupling.
+        target_token_ids, teacher_topk_logprobs = _teacher_topk_targets(teacher_logits, VOCAB)
+        ctx_topk = _make_context("qad_topk_forward", loss_mask, teacher_topk_logprobs, target_token_ids)
+        ctx_full = _make_context("qad_full_kl", loss_mask, torch.log_softmax(teacher_logits, dim=-1))
+
+        s_topk = student_logits.clone().requires_grad_(True)
+        loss_topk = _forward_loss(ctx_topk, s_topk)
+        grad_topk = torch.autograd.grad(loss_topk, s_topk)[0]
+        s_full = student_logits.clone().requires_grad_(True)
+        loss_full = _forward_loss(ctx_full, s_full)
+        grad_full = torch.autograd.grad(loss_full, s_full)[0]
+
+        assert torch.allclose(loss_topk, loss_full, atol=1e-6)
+        assert torch.allclose(grad_topk, grad_full, atol=1e-6)
