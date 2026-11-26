@@ -9,6 +9,7 @@ pipeline and therefore need the training device (the base ``Trainer._init_dist``
 rest of ``tests/train``.
 """
 
+import json
 import logging
 import math
 import os
@@ -59,6 +60,10 @@ TOP_K = 16
 
 
 def _tiny_model_cfg() -> Qwen3DenseConfig:
+    # attn_impl pinned to the eager op: the flash path needs flash-attn 2 (absent here) while the
+    # installed flash-attn-3 dist suppresses MHAConfig's flex fallback but stays unused unless
+    # XTUNER_USE_FA3=1, so the default "flash_attention" crashes at runtime. Eager keeps these
+    # trainer tests attention-backend-agnostic (HF-bitwise path, no torch.compile).
     return Qwen3DenseConfig(
         vocab_size=VOCAB,
         max_position_embeddings=512,
@@ -70,7 +75,9 @@ def _tiny_model_cfg() -> Qwen3DenseConfig:
         intermediate_size=64,  # multiple of the w4a8 per-group group_size (64)
         rms_norm_eps=1e-5,
         hidden_act="silu",
-        attention=MHAConfig(num_attention_heads=4, num_key_value_heads=2, head_dim=16, qk_norm=True),
+        attention=MHAConfig(
+            num_attention_heads=4, num_key_value_heads=2, head_dim=16, qk_norm=True, attn_impl="eager_attention"
+        ),
         compile_cfg=False,
         tie_word_embeddings=False,
         max_window_layers=LAYERS,
@@ -144,6 +151,11 @@ class _FixedLoader:
     def __iter__(self):
         return iter(self.batches)
 
+    def get_state_dict(self) -> dict[str, Any]:
+        # Checkpoint-compatible no-op state: the fixed loader replays a pre-built list, so there
+        # is no consumption cursor to persist.
+        return {"num_batches": len(self.batches)}
+
 
 class _FixedBatchDataloaderConfig(BaseDataloaderConfig):
     batches: list = []
@@ -187,6 +199,16 @@ class _StubBlock(nn.Module):
 def _grad_abs_sum(grad: torch.Tensor) -> float:
     full = grad.full_tensor() if isinstance(grad, DTensor) else grad
     return float(full.abs().sum().item())
+
+
+def _param_snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
+    """CPU clone of every master weight; DTensors are gathered to full tensors
+    first."""
+    snapshot: dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        full = param.full_tensor() if isinstance(param, DTensor) else param
+        snapshot[name] = full.detach().cpu().clone()
+    return snapshot
 
 
 def _minimal_config_dict() -> dict[str, Any]:
@@ -385,6 +407,7 @@ class TestQADTrainerE2E(DeterministicDDPTestCase):
         work_dir: Path,
         total_step: int = 1,
         seeds: tuple[int, ...] = (0,),
+        checkpoint_interval: int | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], QADTrainer | None]:
         records: dict[str, Any] = {
             "losses": [],
@@ -394,6 +417,9 @@ class TestQADTrainerE2E(DeterministicDDPTestCase):
             "recorded": [],
             "frozen_w": [],
             "frozen_kv": [],
+            "weights_before": {},
+            "weights_after": {},
+            "cur_step": -1,
         }
         holder: list[QADTrainer] = []
 
@@ -425,7 +451,7 @@ class TestQADTrainerE2E(DeterministicDDPTestCase):
             global_batch_size=1,
             total_step=total_step,
             work_dir=work_dir / "work_dir",
-            checkpoint_interval=None,
+            checkpoint_interval=checkpoint_interval,
             snapshot_interval=None,
             hf_max_keep=None,
             check_health_interval=None,
@@ -441,7 +467,10 @@ class TestQADTrainerE2E(DeterministicDDPTestCase):
         )
         trainer = _RecordingQADTrainer.from_config(qad_cfg)
         holder.append(trainer)
+        records["weights_before"] = _param_snapshot(trainer._engine.model)
         trainer.fit()
+        records["weights_after"] = _param_snapshot(trainer._engine.model)
+        records["cur_step"] = trainer.cur_step
         state = {
             "fake_quant_count": len(trainer._fake_quant_modules),
             "kv_handle_count": len(trainer._kv_handles),
@@ -485,6 +514,45 @@ class TestQADTrainerE2E(DeterministicDDPTestCase):
             if dist.get_rank() == 0:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_two_step_checkpoint_roundtrip_preserves_frozen_forward(self) -> None:
+        """D-3: checkpoint save -> load round-trip restores a bit-exact frozen-
+        state forward."""
+        self.create_pg(DEVICE)
+        tmp_dir = _broadcast_tmp_dir()
+        try:
+            quant_cfg = _quant_cfg("w8a8", KVQConfig(dtype="int8"), freeze_ratio=0.5)
+            records, _state, trainer = self._run_one_step(
+                quant_cfg, tmp_dir / "roundtrip", total_step=2, seeds=(1, 2), checkpoint_interval=1
+            )
+            holdout_batches = [[_make_batch(seed=3)]]
+            holdout_before = trainer.evaluate_holdout(holdout_batches)
+
+            # Perturb one weight: the frozen-state forward must react to weight changes.
+            with torch.no_grad():
+                first_param = next(trainer._engine.model.parameters())
+                first_param.add_(0.05)
+            holdout_perturbed = trainer.evaluate_holdout(holdout_batches)
+
+            # Then the checkpoint round-trip (saved by fit at checkpoint_interval=1) must restore
+            # the exact pre-perturbation behavior, including the frozen train state.
+            checkpoint_path = Path(trainer.meta.latest_exp.checkpoint_list[-1])
+            assert f"step-{trainer.cur_step}" in str(checkpoint_path)
+            trainer._engine.load_dcp(weights_dir=checkpoint_path / trainer._SAVE_WEIGHTS_DIR, load_states=False)
+            with (checkpoint_path / trainer._SAVE_TRAIN_STATE_PATH).open("r") as f:
+                train_state = json.load(f)
+            trainer._cur_step = train_state["cur_step"]
+            holdout_after = trainer.evaluate_holdout(holdout_batches)
+            del trainer
+
+            assert records["cur_step"] == 2
+            assert train_state["cur_step"] == 2
+            assert holdout_perturbed != holdout_before, "frozen-state forward ignores weight changes"
+            assert holdout_after == holdout_before, "checkpoint round-trip broke the frozen-state forward"
+            dist.barrier()
+        finally:
+            if dist.get_rank() == 0:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_two_step_freeze_engages(self) -> None:
         self.create_pg(DEVICE)
         tmp_dir = _broadcast_tmp_dir()
@@ -497,6 +565,13 @@ class TestQADTrainerE2E(DeterministicDDPTestCase):
             assert records["frozen_w"] == [False, True]
             assert records["frozen_kv"] == [False, True]
             assert math.isfinite(holdout_kl)
+
+            # D-1: the trainer's global step counter advanced exactly with the micro-run.
+            assert records["cur_step"] == 2
+            # D-2: master weights actually moved.
+            before, after = records["weights_before"], records["weights_after"]
+            moved = [name for name in before if not torch.equal(before[name], after[name])]
+            assert moved, "no master weight moved during the 2-step micro-run"
             dist.barrier()
         finally:
             if dist.get_rank() == 0:
