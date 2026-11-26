@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 from safetensors import safe_open
@@ -25,12 +25,15 @@ def download_model_from_hub(
             Default is huggingface.
         cache_dir (str | None):
             The save path when downloading the model. If it is None, it
-            will be stored in the default location of the HUB. For
-            Huggingface, it's ~/.cache/huggingface/hub, for ModelScope,
-            it's ~/.cache/modelscope/hub.
+        will be stored in the default location of the HUB. For
+        Huggingface, it's ~/.cache/huggingface/hub, for ModelScope,
+        it's ~/.cache/modelscope/hub.
     Returns:
         str: The local path of the model.
     """
+    env_hub = os.environ.get("XTUNER_FROM_HUB", "").strip()
+    if env_hub:
+        from_hub = cast(Literal["huggingface", "modelscope"], env_hub)
     if os.path.isdir(model_name_or_path):
         model_path = model_name_or_path
     elif from_hub == "huggingface":
