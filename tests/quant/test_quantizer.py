@@ -6,6 +6,7 @@ import torch
 
 from xtuner.v1.quant import IntQuantizer
 
+
 EPS_FP32 = torch.finfo(torch.float32).eps
 
 

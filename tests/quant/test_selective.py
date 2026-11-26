@@ -59,9 +59,9 @@ class TestSelectiveQuant:
         cfg = QADQuantConfig(quant_schema="w8a8", selective=SelectiveQuantConfig(exclude_first_k_blocks=2))
         apply_quantization(model, cfg)
         names = quantized_names(model)
-        assert f"layers.0.mlp.gate_proj" not in names
-        assert f"layers.1.mlp.down_proj" not in names
-        assert f"layers.2.mlp.gate_proj" in names
+        assert "layers.0.mlp.gate_proj" not in names
+        assert "layers.1.mlp.down_proj" not in names
+        assert "layers.2.mlp.gate_proj" in names
         assert len(names) == 9  # 4 remaining blocks x 2 + lm_head
 
     def test_last_k_blocks_excluded(self) -> None:
@@ -69,16 +69,16 @@ class TestSelectiveQuant:
         cfg = QADQuantConfig(quant_schema="w8a8", selective=SelectiveQuantConfig(exclude_last_k_blocks=1))
         apply_quantization(model, cfg)
         names = quantized_names(model)
-        assert f"layers.5.mlp.gate_proj" not in names
-        assert f"layers.4.mlp.down_proj" in names
+        assert "layers.5.mlp.gate_proj" not in names
+        assert "layers.4.mlp.down_proj" in names
 
     def test_first_and_last_default_w4a8_policy(self) -> None:
         model = build_dummy_model()
         apply_quantization(model, QADQuantConfig.for_schema("w4a8"))
         names = quantized_names(model)
-        assert f"layers.0.mlp.gate_proj" not in names
-        assert f"layers.5.mlp.down_proj" not in names
-        assert f"layers.3.mlp.gate_proj" in names
+        assert "layers.0.mlp.gate_proj" not in names
+        assert "layers.5.mlp.down_proj" not in names
+        assert "layers.3.mlp.gate_proj" in names
 
     def test_embedding_and_lm_head_untouched_by_contract(self) -> None:
         # Contract (design doc §4.1): apply_quantization only touches nn.Linear instances;

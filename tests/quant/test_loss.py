@@ -14,6 +14,7 @@ from xtuner.v1.quant.loss import (
 )
 from xtuner.v1.rl.loss.distillation_loss import compute_topk_distillation_kl
 
+
 VOCAB = 128
 TOP_K = 16
 BATCH = 2
@@ -180,9 +181,9 @@ class TestQADLossEquivalence:
         loss = _forward_loss(loss_ctx, student_logits)
 
         student_topk_logprobs = torch.log_softmax(student_logits, dim=-1).gather(dim=-1, index=target_token_ids)
-        reference = compute_topk_distillation_kl(
-            student_topk_logprobs, teacher_topk_logprobs, "forward", -10.0, 10.0
-        )[0]
+        reference = compute_topk_distillation_kl(student_topk_logprobs, teacher_topk_logprobs, "forward", -10.0, 10.0)[
+            0
+        ]
         assert torch.allclose(loss, _masked_mean(reference, loss_mask), atol=1e-6)
 
     def test_full_kl_equals_topk_forward_with_k_equals_v(self) -> None:
@@ -283,12 +284,8 @@ class TestQADLossReduction:
         teacher_logprobs_2 = torch.log_softmax(teacher_logits_2, dim=-1)
 
         loss_cfg = QADLossConfig(mode="qad_full_kl")
-        ctx_1 = QADLossContext(
-            loss_cfg, QADLossKwargs(loss_mask=loss_mask_1, teacher_logprobs=teacher_logprobs_1)
-        )
-        ctx_2 = QADLossContext(
-            loss_cfg, QADLossKwargs(loss_mask=loss_mask_2, teacher_logprobs=teacher_logprobs_2)
-        )
+        ctx_1 = QADLossContext(loss_cfg, QADLossKwargs(loss_mask=loss_mask_1, teacher_logprobs=teacher_logprobs_1))
+        ctx_2 = QADLossContext(loss_cfg, QADLossKwargs(loss_mask=loss_mask_2, teacher_logprobs=teacher_logprobs_2))
         QADLossContext.build_batches([ctx_1, ctx_2])
         loss_1 = _forward_loss(ctx_1, student_logits_1)
         loss_2 = _forward_loss(ctx_2, student_logits_2)

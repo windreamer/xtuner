@@ -9,6 +9,7 @@ from xtuner.v1.quant.loss import QADLossConfig, QADLossContext
 from xtuner.v1.quant.teacher import QADTeacherAdapter, QADTeacherAdapterConfig
 from xtuner.v1.rl.distillation.config import TrainTeacherConfig
 
+
 VOCAB = 32
 TOP_K = 8
 BATCH = 2
