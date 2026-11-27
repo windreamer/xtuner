@@ -55,8 +55,11 @@ import torch
 
 from xtuner._testing import DeterministicDDPTestCase
 
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
-EFFECT_DIR = REPO_ROOT / "work_dir" / "qad_sim" / "effect"
+EFFECT_DIR = Path(os.environ.get("QAD_EFFECT_DIR", REPO_ROOT / "work_dir" / "qad_sim" / "effect"))
+# Committed copy of the effect harness (run_real.py); used when the local work_dir copy is absent.
+HARNESS_DIR = REPO_ROOT / "recipe" / "qad" / "effect_harness"
 
 QAD_REGRESSION_MODEL_PATH = os.environ.get("QAD_REGRESSION_MODEL_PATH")
 _DEFAULT_MODEL = EFFECT_DIR / "model" / "Qwen3-0.6B-untied"
@@ -91,9 +94,9 @@ def _dist_rank() -> int:
 def _sys_path_prep() -> None:
     import sys  # noqa: PLC0415
 
-    effect = str(EFFECT_DIR)
-    if effect not in sys.path:
-        sys.path.insert(0, effect)
+    for p in (str(EFFECT_DIR), str(HARNESS_DIR)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
 
 # Authored real-text samples (deterministic; disjoint train/holdout halves).
