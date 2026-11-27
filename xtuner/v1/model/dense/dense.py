@@ -229,7 +229,10 @@ class Dense(BaseModel):
                 self.precision.pin_unit(self.embed_tokens)
         num_recompute_layers = int(self.config.num_hidden_layers * self.fsdp_config.recompute_ratio)
 
-        generator = torch.Generator()
+        # randperm runs on the default device; a CPU generator raises under a CUDA default
+        # device. The shuffle only picks layer sharding order, so any device works, and the
+        # rank-seeded CPU sequence is unchanged on CPU-default environments.
+        generator = torch.Generator(device=torch.get_default_device())
         generator.manual_seed(dist.get_rank())
         shuffled_layers_idxs = torch.randperm(len(self.layers), generator=generator)
 
