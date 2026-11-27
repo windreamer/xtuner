@@ -325,6 +325,7 @@ class ExpandSoftPackDataset(_LegacySoftPackDataset):
         self.pack_extra_buffer_size = pack_extra_buffer_size
         self.pack_workers = pack_workers
         self.torch_random_generator = torch.Generator()
+        self._pack_seed = seed
         self.pack_chunk_size = pack_chunk_size
         if seed is not None:
             self.torch_random_generator.manual_seed(seed)
@@ -337,10 +338,26 @@ class ExpandSoftPackDataset(_LegacySoftPackDataset):
             seed=seed,
         )
 
+    def _generator_on_default_device(self) -> torch.Generator:
+        """Return the pack generator aligned with the default device.
+
+        ``torch.randperm`` runs on the default device; a CPU generator raises under a CUDA
+        default device (FSDP2 sets one before dataset build). The device-mismatch case gets a
+        fresh generator seeded with the same pack seed, so packing stays deterministic
+        per-device.
+        """
+        device = torch.get_default_device()
+        if self.torch_random_generator.device.type == device.type:
+            return self.torch_random_generator
+        gen = torch.Generator(device=device)
+        if self._pack_seed is not None:
+            gen.manual_seed(self._pack_seed)
+        return gen
+
     def get_pack_infos(
         self, dataset: Sized, dataset_id: int, num_tokens: np.ndarray, proxy_attn_flops: np.ndarray | None = None
     ):
-        inds = torch.randperm(len(dataset), generator=self.torch_random_generator).tolist()
+        inds = torch.randperm(len(dataset), generator=self._generator_on_default_device()).tolist()
         pack_infos = get_pack_infos_by_expand_soft_split(
             inds,
             dataset_id,
