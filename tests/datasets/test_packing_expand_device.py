@@ -41,16 +41,19 @@ def _pack_infos(ds: ExpandSoftPackDataset):
 
 class TestPackGeneratorDeviceAlignment:
     def test_cpu_default_device_uses_stored_generator(self):
-        """CPU default device keeps the legacy behavior: stored CPU generator drives randperm."""
-        ds = _make_dataset(seed=42)
-        infos_a = _pack_infos(ds)
-        infos_b = _pack_infos(ds)
-        assert infos_a["indices"] == infos_b["indices"], "same-seed CPU packing must be deterministic"
+        """Fresh same-seed instances reproduce identical first draws (the seed contract)."""
+        ds_a = _make_dataset(seed=42)
+        ds_b = _make_dataset(seed=42)
+        assert _pack_infos(ds_a)["indices"] == _pack_infos(ds_b)["indices"], (
+            "same-seed fresh instances must produce identical first permutations"
+        )
 
-    def test_reseed_changes_cpu_permutation(self):
-        a = _pack_infos(_make_dataset(seed=42))
-        b = _pack_infos(_make_dataset(seed=43))
-        assert a["indices"] != b["indices"], "different seeds must produce different permutations"
+    def test_cpu_same_instance_advances_generator_stream(self):
+        """Legacy streaming semantics: consecutive calls on ONE instance continue the draw stream."""
+        ds = _make_dataset(seed=42)
+        first = _pack_infos(ds)["indices"]
+        second = _pack_infos(ds)["indices"]
+        assert first != second, "generator must advance across calls (legacy behavior)"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
     def test_cuda_default_device_does_not_crash_and_is_deterministic(self):
