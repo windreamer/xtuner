@@ -4,7 +4,6 @@ from typing import Annotated, Callable, Literal, cast
 
 import torch
 from cyclopts import Parameter
-from mmengine import is_installed
 from pydantic import BaseModel, ConfigDict
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -15,7 +14,13 @@ from xtuner.v1.config import GenerateConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module.rope import RopeScalingConfig
-from xtuner.v1.ops import AttnOpOutputs, flash_attn_varlen_func, get_apply_rotary_emb, get_attn_impl_fn
+from xtuner.v1.ops import (
+    AttnOpOutputs,
+    flash_attn_available,
+    flash_attn_varlen_func,
+    get_apply_rotary_emb,
+    get_attn_impl_fn,
+)
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_logger, log_rank0
 
@@ -46,10 +51,17 @@ class MHAConfig(BaseModel):
     attn_impl: Literal["flash_attention", "flex_attention", "eager_attention"] = "flash_attention"
 
     def model_post_init(self, _):
-        if self.attn_impl == "flash_attention" and get_device() == "cuda":
-            if not (is_installed("flash-attn") or is_installed("flash-attn-3")):
-                log_rank0.warning("flash-attn is not installed, using `flex_attention` instead.")
+        if get_device() == "cuda":
+            if self.attn_impl == "flash_attention" and not flash_attn_available():
+                # An installed dist (e.g. flash-attn-3) does not imply usable callables; probe them.
+                log_rank0.warning(
+                    "FlashAttention callables are unavailable on this device; falling back from `flash_attention` "
+                    "to `flex_attention`."
+                )
                 self.attn_impl = "flex_attention"
+            if self.attn_impl == "flex_attention" and not _flex_attention_available():
+                log_rank0.warning("torch flex_attention is unavailable; falling back to `eager_attention`.")
+                self.attn_impl = "eager_attention"
         return self
 
     def build(
@@ -473,3 +485,11 @@ class MultiHeadAttention(nn.Module):
     ) -> AttnOutputs: ...
 
     __call__ = nn.Module.__call__
+
+
+def _flex_attention_available() -> bool:
+    try:
+        from torch.nn.attention.flex_attention import flex_attention  # noqa: F401
+    except ImportError:
+        return False
+    return True
