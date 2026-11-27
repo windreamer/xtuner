@@ -1,12 +1,14 @@
 from functools import partial
-from torch import nn
-import torch
-from typing import Union, Optional, Callable, Self
-from typing_extensions import override
-import numpy as np
+from typing import Callable, Optional, Self, Union
 
-from transformers.models.internvl.modeling_internvl import InternVLVisionEmbeddings
+import numpy as np
+import torch
+from torch import nn
+from typing_extensions import override
+
 from transformers.modeling_outputs import BaseModelOutput
+from transformers.models.internvl.modeling_internvl import InternVLVisionEmbeddings
+
 
 _timm_import_error: ImportError | None = None
 
@@ -19,29 +21,35 @@ except (ImportError, ModuleNotFoundError) as e:
 else:
     has_timm = True
     _timm_import_error = None
-from tqdm import tqdm
-from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_torch_device_module, init_params, log_rank0
-from xtuner.v1.model import BaseModel
-from xtuner.v1.config import FSDPConfig
-from .intern_s1_config import InternS1VisionConfig
-from xtuner.v1.float8.float8_handler import Float8Handler
-from torch.distributed.device_mesh import init_device_mesh
+import os
+
 import torch.distributed as dist
-from xtuner.v1.utils.compile import maybe_compile
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
-    fully_shard,
 )
-from xtuner.v1.ops.attn_imp import attn_impl_mapping, AttnOpOutputs
+from tqdm import tqdm
+
+from xtuner.v1.config import FSDPConfig
+from xtuner.v1.model import BaseModel
 from xtuner.v1.model.utils.checkpointing import apply_activation_checkpointing
-from xtuner.v1.module import RMSNorm
-from xtuner.v1.ops.others import Dropout
+from xtuner.v1.module import AttnOutputs, RMSNorm
 from xtuner.v1.ops.act_fn import get_act_fn
-from xtuner.v1.utils import get_logger
-from xtuner.v1.module import AttnOutputs
-import os
+from xtuner.v1.ops.attn_imp import AttnOpOutputs, attn_impl_mapping
+from xtuner.v1.ops.others import Dropout
+from xtuner.v1.utils import (
+    XTUNER_DETERMINISTIC,
+    get_device,
+    get_logger,
+    get_torch_device_module,
+    init_params,
+    log_rank0,
+)
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
+
+from .intern_s1_config import InternS1VisionConfig
+
 
 DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
@@ -199,8 +207,8 @@ class InternS1VisionLayer(nn.Module):
         init_values = self.config.layer_scale_init_value
         init_params(self.lambda_1, lambda x: x.fill_(init_values))
         init_params(self.lambda_2, lambda x: x.fill_(init_values))
-        initialized_params.add(f"lambda_1")
-        initialized_params.add(f"lambda_2")
+        initialized_params.add("lambda_1")
+        initialized_params.add("lambda_2")
 
         if (missing := {name for name, _ in self.named_parameters()} - initialized_params):
             raise RuntimeError(f"{missing} is not initialized")
@@ -400,7 +408,8 @@ class InternS1VisionModel(BaseModel):
         recompute_ratio = fsdp_config.vision_recompute_ratio
         num_recompute_layers = int(len(self.encoder.layer) * recompute_ratio)
 
-        generator = torch.Generator()
+        # randperm runs on the default device; align the generator (same fix as dense.py).
+        generator = torch.Generator(device=torch.get_default_device())
         generator.manual_seed(dist.get_rank())
         shuffled_layers_idxs = torch.randperm(len(self.encoder.layer), generator=generator)
 

@@ -96,7 +96,9 @@ class ParallelSampler(Sampler):
         """Iterate the indices."""
         # deterministically shuffle based on epoch and seed
         if self.shuffle:
-            g = torch.Generator()
+            # randperm runs on the default device; a CPU generator raises under a CUDA default
+            # device (FSDP2). Aligning keeps the rank/epoch-seeded sequence per device.
+            g = torch.Generator(device=torch.get_default_device())
             g.manual_seed(self.seed + self.epoch)
             indices = torch.randperm(len(self.dataset), generator=g).tolist()
         else:
@@ -199,7 +201,9 @@ class LengthGroupedSampler(Sampler):
 
         self.rank = rank
         self.world_size = world_size
-        self.torch_generator = torch.Generator()
+        # Aligned with the default device: consumed by __iter__ (main process) via randperm,
+        # which would raise on a CPU generator under a CUDA default device (FSDP2).
+        self.torch_generator = torch.Generator(device=torch.get_default_device())
         self.random_generator = random.Random()
         assert global_batch_size % world_size == 0
 

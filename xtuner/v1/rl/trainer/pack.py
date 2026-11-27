@@ -420,7 +420,9 @@ class RLDataPacker:
         data_lengths: Sequence[int],
     ) -> PackedDataIndices:
         seed = self.pack_seed if self.pack_seed is not None else _BALANCE_DEFAULT_SEED
-        torch_generator = torch.Generator().manual_seed(seed)
+        # randperm runs on the default device; align the generator (CPU generator raises
+        # under a CUDA default device).
+        torch_generator = torch.Generator(device=torch.get_default_device()).manual_seed(seed)
         random_generator = random.Random(seed)
         grouped_indices = get_length_grouped_indices(
             max_lengths=list(data_lengths),

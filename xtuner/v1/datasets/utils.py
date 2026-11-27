@@ -592,7 +592,9 @@ def get_sampler_config(
             mega_batch_mult = 1
         group_batch_size = mega_batch_mult * global_batch_size
         group_size = world_size
-        torch_generator = torch.Generator()
+        # randperm runs on the default device; align the generator (CPU generator raises
+        # under a CUDA default device, e.g. FSDP2).
+        torch_generator = torch.Generator(device=torch.get_default_device())
         torch_generator.manual_seed(seed + epoch)
         random_generator = random.Random()
         random_generator.seed(seed + epoch)

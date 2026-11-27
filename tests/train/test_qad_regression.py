@@ -25,12 +25,11 @@ XTuner QAD gates (strictly stronger than the ModelOpt lane):
   training-end logits bit-exactly on a holdout row.
 
 Measured baseline (documented for a future absolute floor, ModelOpt-style):
-- RTX 3090 24GB, 2026-11-27, full run = 500 steps, LR 1e-6 constant (ablation winner;
-  LR 1e-5 at this effective batch made holdout KL RISE 0.026 -> 0.135), pack 1024,
-  corpus = AI-ModelScope/alpaca-gpt4-data-en slice:
-  PTQ holdout KL ≈ 0.0261, QAD-end holdout KL ≈ 0.0242 (Gate B −7.2%),
-  first/final cumulative-mean train-KL ≈ 0.02823/0.02775,
-  final windowed train-KL ≈ 0.02916 (work_dir/qad_sim/effect/ablation-a1-final/result.json).
+- RTX 3090 24GB, 2026-11-27, LR sweep winner = 5e-7 @ gbs 1 (see the LR-sweep task in the
+  A100 handoff; sweep ran this exact corpus, 300 steps, eager):
+  PTQ holdout KL ≈ 0.0237, QAD-end holdout KL ≈ 0.0181 (Gate B −23.6%),
+  cumulative-mean train-KL 0.03457 → 0.01581 (−54.3%)
+  (work_dir/qad_sim/effect/sweep_lr_accum/lr5e-7_gbs1/result.json).
 
 Skip discipline (mirrors ModelOpt's flag-gated nightly/manual lane): the test is skipped
 unless a real Qwen3-0.6B checkpoint directory exists at ``QAD_REGRESSION_MODEL_PATH`` or at
@@ -220,7 +219,7 @@ class TestQADRealModelRegression(DeterministicDDPTestCase):
                     schema="w8a8",
                     kv_dtype="int8",
                     total_steps=TEST_STEPS,
-                    lr=1e-6,
+                    lr=5e-7,
                     train_kl_interval=TRAIN_KL_INTERVAL,
                     holdout_interval=TEST_STEPS,
                     pack_max_length=1024,
