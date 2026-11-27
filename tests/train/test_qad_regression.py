@@ -56,6 +56,10 @@ import torch
 from xtuner._testing import DeterministicDDPTestCase
 
 
+# The 300-step eager lane needs ~10-15 min; torch's distributed test wrapper kills the
+# training subprocess at 300 s by default (DISTRIBUTED_TESTS_DEFAULT_TIMEOUT).
+os.environ.setdefault("DISTRIBUTED_TESTS_DEFAULT_TIMEOUT", "1800")
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EFFECT_DIR = Path(os.environ.get("QAD_EFFECT_DIR", REPO_ROOT / "work_dir" / "qad_sim" / "effect"))
 # Committed copy of the effect harness (run_real.py); used when the local work_dir copy is absent.
@@ -66,7 +70,7 @@ _DEFAULT_MODEL = EFFECT_DIR / "model" / "Qwen3-0.6B-untied"
 
 # Calibration knobs for the regression lane (ModelOpt runs N=500 at timeout 300s on L40;
 # this host is ~3s/step, so the lane runs a shorter schedule).
-TEST_STEPS = 60
+TEST_STEPS = 300
 TRAIN_KL_INTERVAL = 10
 # Sanity floor, ModelOpt form ("final loss should be reasonable"): the 500-step effect-lane
 # run at LR 1e-6 (work_dir/qad_sim/effect/ablation-a1-final, RTX 3090, 2026-11-27) measured
@@ -190,6 +194,12 @@ class TestQADRealModelRegression(DeterministicDDPTestCase):
         # to attention-backend selection; no eager pin is needed for selection anymore — the
         # default `MHAConfig` path builds and forwards (see tests/ops/test_flash_attn_selection.py).
 
+        # NOTE (2026-11-27): the packing RNG device bug below (`datasets/packing.py:343`,
+        # "Expected a 'cuda' device type for generator but found 'cpu'") is FIXED on this
+        # branch (`ExpandSoftPackDataset._generator_on_default_device`). Attention-backend
+        # selection is fail-soft since commit 9989582 (default path builds and forwards; see
+        # tests/ops/test_flash_attn_selection.py).
+
         model_dir = str(_model_dir())
         tmp_dir = tempfile.mkdtemp(prefix="qad_regression_")
         exp_dir = Path(tmp_dir) / "w8a8-kvint8"
@@ -197,21 +207,26 @@ class TestQADRealModelRegression(DeterministicDDPTestCase):
             train_jsonl = Path(tmp_dir) / "train.jsonl"
             holdout_jsonl = Path(tmp_dir) / "holdout.jsonl"
             _write_corpus(train_jsonl, holdout_jsonl)
-            result = run_qad(
-                model_dir=model_dir,
-                train_jsonl=str(train_jsonl),
-                holdout_jsonl=str(holdout_jsonl),
-                exp_dir=exp_dir,
-                schema="w8a8",
-                kv_dtype="int8",
-                total_steps=TEST_STEPS,
-                lr=1e-6,
-                train_kl_interval=TRAIN_KL_INTERVAL,
-                holdout_interval=TEST_STEPS,
-                pack_max_length=1024,
-                holdout_rows=64,
-                generation=False,
-            )
+            # Pin the HF-exact eager attention for this lane: the loss-trend/gate assertions
+            # must hold on any machine, and usable backends differ per host (no FA2 here, FA3
+            # corrupts on SM86, torch 2.13 Inductor flex_decoding has no SM86 kernels). 60
+            # eager steps cost minutes and are deterministic; A100 keeps the same contract.
+            with self.hf_impl():
+                result = run_qad(
+                    model_dir=model_dir,
+                    train_jsonl=str(train_jsonl),
+                    holdout_jsonl=str(holdout_jsonl),
+                    exp_dir=exp_dir,
+                    schema="w8a8",
+                    kv_dtype="int8",
+                    total_steps=TEST_STEPS,
+                    lr=1e-6,
+                    train_kl_interval=TRAIN_KL_INTERVAL,
+                    holdout_interval=TEST_STEPS,
+                    pack_max_length=1024,
+                    holdout_rows=64,
+                    generation=False,
+                )
 
             # --- ModelOpt-lane form ----------------------------------------------------------
             # Loss-decrease uses the CUMULATIVE-MEAN train-KL (measured 0.02823 -> 0.02775 over
@@ -234,8 +249,7 @@ class TestQADRealModelRegression(DeterministicDDPTestCase):
 
             # --- XTuner QAD gates (stronger than ModelOpt) ------------------------------------
             assert result["kl_b_end"] < result["kl_ptq"], (
-                f"Gate B failed: holdout end KL {result['kl_b_end']:.6f} >= PTQ baseline "
-                f"{result['kl_ptq']:.6f}"
+                f"Gate B failed: holdout end KL {result['kl_b_end']:.6f} >= PTQ baseline {result['kl_ptq']:.6f}"
             )
             assert result["gate_c_logits_equal"], (
                 f"Gate C failed: replayed export logits differ (max abs diff "
