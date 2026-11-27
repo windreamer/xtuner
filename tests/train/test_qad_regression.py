@@ -155,7 +155,8 @@ _SUFFIXES = [
 def _write_corpus(train_path: Path, holdout_path: Path) -> None:
     """Deterministic real-text jsonl corpus through the qwen3 chat template
     convention."""
-    train_rows, holdout_rows = [], []
+    train_rows: list[dict] = []
+    holdout_rows: list[dict] = []
     for i, (q, a) in enumerate(_QA_SAMPLES):
         for j, suffix in enumerate(_SUFFIXES):
             user = f"{q}{(' ' + suffix) if suffix else ''}"
